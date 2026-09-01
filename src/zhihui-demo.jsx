@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from "react";
+import React, { useState, useMemo, useRef, useEffect } from "react";
 
 // 模型凭证已全部移到后端 backend/.env（gitignore），前端只通过受控 API 调用，
 // 不接触任何 Key（见通用技术栈手册 A 层底线）。
@@ -65,11 +65,12 @@ const STEPS = [
 ];
 
 // 统一 API 封装：前端只走后端受控接口，不接触任何模型凭证
-async function apiPost(path, body) {
+async function apiPost(path, body, signal) {
   const res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -78,32 +79,45 @@ async function apiPost(path, body) {
   return data;
 }
 
-export default function ZhihuiDemo() {
-  const [brief, setBrief] = useState(SAMPLE_BRIEF);
-  const [persona, setPersona] = useState("daily");
-  const [type, setType] = useState("poster");
-  const [style, setStyle] = useState("realistic");
-  const [bgPrompt, setBgPrompt] = useState("");
+// 断线恢复：工作流结果自动持久化到 localStorage，刷新后回填
+const SESSION_KEY = "zhihui_session_v1";
 
-  const [parsed, setParsed] = useState(null);
-  const [topics, setTopics] = useState(null);
-  const [picked, setPicked] = useState(null);
-  const [content, setContent] = useState(null);
+function readSession() {
+  try {
+    return JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+export default function ZhihuiDemo() {
+  const [session] = useState(readSession);
+  const [brief, setBrief] = useState(session?.brief ?? SAMPLE_BRIEF);
+  const [persona, setPersona] = useState(session?.persona ?? "daily");
+  const [type, setType] = useState(session?.type ?? "poster");
+  const [style, setStyle] = useState(session?.style ?? "realistic");
+  const [bgPrompt, setBgPrompt] = useState(session?.bgPrompt ?? "");
+
+  const [parsed, setParsed] = useState(session?.parsed ?? null);
+  const [topics, setTopics] = useState(session?.topics ?? null);
+  const [picked, setPicked] = useState(session?.picked ?? null);
+  const [content, setContent] = useState(session?.content ?? null);
 
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
   const contentReqRef = useRef(0);
+  const abortRef = useRef(null);
   const fileInputRef = useRef(null);
   const docInputRef = useRef(null);
   const logoInputRef = useRef(null);
-  const [segUrl, setSegUrl] = useState(null);
+  const [segUrl, setSegUrl] = useState(session?.segUrl ?? null);
   const [segBusy, setSegBusy] = useState(false);
   const [segErr, setSegErr] = useState("");
-  const [logoUrl, setLogoUrl] = useState(null);
-  const [compositeUrl, setCompositeUrl] = useState(null);
-  const [compositeObjectKey, setCompositeObjectKey] = useState("");
+  const [logoUrl, setLogoUrl] = useState(session?.logoUrl ?? null);
+  const [compositeUrl, setCompositeUrl] = useState(session?.compositeUrl ?? null);
+  const [compositeObjectKey, setCompositeObjectKey] = useState(session?.compositeObjectKey ?? "");
   const [compositeBusy, setCompositeBusy] = useState(false);
-  const [compositeVqa, setCompositeVqa] = useState(null);
+  const [compositeVqa, setCompositeVqa] = useState(session?.compositeVqa ?? null);
   const [compositeErr, setCompositeErr] = useState("");
 
   const HISTORY_KEY = "zhihui_history_v1";
@@ -136,9 +150,44 @@ export default function ZhihuiDemo() {
     }
   };
 
+  // 取消当前进行中的长请求（解析/选题/文案/背景图/合成）
+  const cancelCurrent = () => {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+  };
+
+  // 断线恢复：结果状态一旦变化就持久化，刷新后回填
+  useEffect(() => {
+    const snapshot = {
+      brief,
+      persona,
+      type,
+      style,
+      bgPrompt,
+      parsed,
+      topics,
+      picked,
+      content,
+      segUrl,
+      logoUrl,
+      compositeUrl,
+      compositeObjectKey,
+      compositeVqa,
+      ts: Date.now(),
+    };
+    try {
+      localStorage.setItem(SESSION_KEY, JSON.stringify(snapshot));
+    } catch {
+      /* 存储满或隐私模式，静默失败 */
+    }
+  }, [brief, persona, type, style, bgPrompt, parsed, topics, picked, content, segUrl, logoUrl, compositeUrl, compositeObjectKey, compositeVqa]);
+
   const stage = content ? 4 : topics ? (picked ? 3 : 2) : parsed ? 2 : 1;
 
   const reset = () => {
+    cancelCurrent();
     contentReqRef.current++;
     setParsed(null);
     setTopics(null);
@@ -156,46 +205,58 @@ export default function ZhihuiDemo() {
   };
 
   const runParse = async () => {
+    cancelCurrent();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setBusy("parse");
     setErr("");
     setTopics(null);
     setPicked(null);
     setContent(null);
     try {
-      const r = await apiPost("/api/v1/parse", { brief });
+      const r = await apiPost("/api/v1/parse", { brief }, controller.signal);
       setParsed(r);
     } catch (e) {
-      setErr("解析失败，请重试：" + e.message);
+      if (e.name !== "AbortError") setErr("解析失败，请重试：" + e.message);
     }
+    if (abortRef.current === controller) abortRef.current = null;
     setBusy("");
   };
 
   const runTopics = async () => {
+    cancelCurrent();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setBusy("topics");
     setErr("");
     setPicked(null);
     setContent(null);
     try {
-      const r = await apiPost("/api/v1/topics", { parsed, type, persona });
+      const r = await apiPost("/api/v1/topics", { parsed, type, persona }, controller.signal);
       const list = r.topics || [];
       if (!list.length) {
         throw new Error("模型未返回选题");
       }
       setTopics(list);
     } catch (e) {
-      setErr("选题生成失败，请重试：" + e.message);
+      if (e.name !== "AbortError") setErr("选题生成失败，请重试：" + e.message);
     }
+    if (abortRef.current === controller) abortRef.current = null;
     setBusy("");
   };
 
   const runContent = async (topic) => {
+    cancelCurrent();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const signal = controller.signal;
     setBusy("content");
     setErr("");
     setPicked(topic);
     setContent(null);
     const reqId = ++contentReqRef.current;
     try {
-      const r = await apiPost("/api/v1/content", { parsed, type, persona, topic, style });
+      const r = await apiPost("/api/v1/content", { parsed, type, persona, topic, style }, signal);
       if (!r || !r.cover) {
         throw new Error("模型未返回有效的图文数据");
       }
@@ -203,13 +264,13 @@ export default function ZhihuiDemo() {
       setContent({ ...r, bgImageUrl: null, bgStatus: "generating", bgError: "", vqa: null, vqaStatus: "idle", vqaError: "" });
       setBgPrompt(r.cover?.bg_prompt || "");
       setBusy("");
-      apiPost("/api/v1/image", { prompt: r.cover.bg_prompt, style })
+      apiPost("/api/v1/image", { prompt: r.cover.bg_prompt, style }, signal)
         .then((img) => {
           if (contentReqRef.current !== reqId) return;
           setContent((prev) =>
             prev ? { ...prev, bgImageUrl: img.url, bgStatus: "done", vqaStatus: "running" } : prev
           );
-          return apiPost("/api/v1/vqa", { image_url: img.url, style })
+          return apiPost("/api/v1/vqa", { image_url: img.url, style }, signal)
             .then((vqaRes) => {
               if (contentReqRef.current !== reqId) return;
               setContent((prev) =>
@@ -218,6 +279,12 @@ export default function ZhihuiDemo() {
             })
             .catch((vqaErr) => {
               if (contentReqRef.current !== reqId) return;
+              if (vqaErr.name === "AbortError") {
+                setContent((prev) =>
+                  prev ? { ...prev, vqaStatus: "idle" } : prev
+                );
+                return;
+              }
               setContent((prev) =>
                 prev ? { ...prev, vqaStatus: "error", vqaError: vqaErr.message } : prev
               );
@@ -225,13 +292,20 @@ export default function ZhihuiDemo() {
         })
         .catch((imgErr) => {
           if (contentReqRef.current !== reqId) return;
+          if (imgErr.name === "AbortError") {
+            setContent((prev) =>
+              prev ? { ...prev, bgStatus: "idle", bgError: "已取消，可重新生成" } : prev
+            );
+            return;
+          }
           setContent((prev) =>
             prev ? { ...prev, bgStatus: "error", bgError: imgErr.message } : prev
           );
         });
       return;
     } catch (e) {
-      setErr("图文生成失败，请重试：" + e.message);
+      if (e.name !== "AbortError") setErr("图文生成失败，请重试：" + e.message);
+      if (abortRef.current === controller) abortRef.current = null;
     }
     setBusy("");
   };
@@ -270,6 +344,9 @@ export default function ZhihuiDemo() {
 
   const runComposite = async () => {
     if (!content?.bgImageUrl) return;
+    cancelCurrent();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setCompositeBusy(true);
     setCompositeErr("");
     try {
@@ -278,10 +355,10 @@ export default function ZhihuiDemo() {
         product_url: segUrl || "",
         logo_base64: logoUrl || "",
         cover: content.cover,
-      });
+      }, controller.signal);
       setCompositeUrl(comp.url);
       setCompositeObjectKey(comp.object_key || "");
-      const vqaRes = await apiPost("/api/v1/vqa", { image_url: comp.url, style });
+      const vqaRes = await apiPost("/api/v1/vqa", { image_url: comp.url, style }, controller.signal);
       setCompositeVqa(vqaRes.items || []);
       saveHistory({
         ts: Date.now(),
@@ -293,30 +370,49 @@ export default function ZhihuiDemo() {
         objectKey: comp.object_key || "",
       });
     } catch (e) {
-      setCompositeErr("合成质检失败：" + e.message);
+      if (e.name !== "AbortError") setCompositeErr("合成质检失败：" + e.message);
     }
+    if (abortRef.current === controller) abortRef.current = null;
     setCompositeBusy(false);
   };
 
   const runRegenerate = async () => {
     if (!content || content.bgStatus === "generating") return;
+    cancelCurrent();
+    const controller = new AbortController();
+    abortRef.current = controller;
     const reqId = ++contentReqRef.current;
     setContent((prev) =>
       prev ? { ...prev, bgStatus: "generating", bgError: "", vqaStatus: "running" } : prev
     );
     try {
-      const img = await apiPost("/api/v1/image", { prompt: bgPrompt, style });
+      const img = await apiPost("/api/v1/image", { prompt: bgPrompt, style }, controller.signal);
       if (contentReqRef.current !== reqId) return;
       setContent((prev) => (prev ? { ...prev, bgImageUrl: img.url, bgStatus: "done" } : prev));
-      const vqaRes = await apiPost("/api/v1/vqa", { image_url: img.url, style });
+      const vqaRes = await apiPost("/api/v1/vqa", { image_url: img.url, style }, controller.signal);
       if (contentReqRef.current !== reqId) return;
       setContent((prev) => (prev ? { ...prev, vqa: vqaRes.items || [], vqaStatus: "done" } : prev));
     } catch (e) {
       if (contentReqRef.current !== reqId) return;
+      if (e.name === "AbortError") {
+        // 取消：保留已有的背景图与质检结果
+        setContent((prev) =>
+          prev
+            ? {
+                ...prev,
+                bgStatus: prev.bgImageUrl ? "done" : "idle",
+                bgError: "",
+                vqaStatus: prev.vqa?.length ? "done" : "idle",
+              }
+            : prev
+        );
+        return;
+      }
       setContent((prev) =>
         prev ? { ...prev, bgStatus: "error", bgError: e.message, vqaStatus: "error", vqaError: e.message } : prev
       );
     }
+    if (abortRef.current === controller) abortRef.current = null;
   };
 
   // 客户端硬规则质检（不依赖模型判断）
@@ -490,6 +586,33 @@ export default function ZhihuiDemo() {
           }}
         >
           {err}
+        </div>
+      )}
+
+      {(busy || content?.bgStatus === "generating" || compositeBusy) && (
+        <div style={{ marginBottom: 14, display: "flex", alignItems: "center", gap: 10 }}>
+          <button
+            style={{
+              background: C.surface,
+              color: C.block,
+              border: `1px solid ${C.block}`,
+              borderRadius: 3,
+              padding: "7px 14px",
+              fontSize: 12.5,
+              fontFamily: FONT,
+              cursor: "pointer",
+            }}
+            onClick={cancelCurrent}
+          >
+            取消当前操作
+          </button>
+          <span style={{ ...S.sub }}>
+            {busy
+              ? "正在请求模型，可取消"
+              : content?.bgStatus === "generating"
+              ? "背景图生成中，可取消"
+              : "合成中，可取消"}
+          </span>
         </div>
       )}
 
